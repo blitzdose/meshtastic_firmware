@@ -1,4 +1,5 @@
 #include "CryptoEngine.h"
+#include "HardwareRNG.h"
 #include "PortduinoGPIO.h"
 #include "SPIChip.h"
 #include "mesh/RF95Interface.h"
@@ -8,20 +9,24 @@
 #include "PortduinoGlue.h"
 #include "SHA256.h"
 #include "api/ServerAPI.h"
-#include "linux/gpio/LinuxGPIOPin.h"
 #include "meshUtils.h"
 #include <ErriezCRC32.h>
 #include <Utility.h>
 #include <assert.h>
-#include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+#ifdef PORTDUINO_LINUX_HARDWARE
+#include "linux/gpio/LinuxGPIOPin.h"
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/hci.h>
+#endif
 
 #ifdef PORTDUINO_LINUX_HARDWARE
 #include <cxxabi.h>
@@ -128,9 +133,9 @@ void getMacAddr(uint8_t *dmac)
         }
     } else if (portduino_config.mac_address.length() > 11) {
         MAC_from_string(portduino_config.mac_address, dmac);
-        exit;
+        return;
     } else {
-
+#ifdef PORTDUINO_LINUX_HARDWARE
         struct hci_dev_info di = {0};
         di.dev_id = 0;
         bdaddr_t bdaddr;
@@ -150,6 +155,11 @@ void getMacAddr(uint8_t *dmac)
         dmac[3] = di.bdaddr.b[2];
         dmac[4] = di.bdaddr.b[1];
         dmac[5] = di.bdaddr.b[0];
+#else
+        // No BlueZ on non-Linux hosts (e.g. macOS). Leave dmac at its default;
+        // the caller can override via the --hwid CLI flag or the YAML config.
+        (void)dmac;
+#endif
     }
 }
 
@@ -179,6 +189,10 @@ void portduinoSetup()
 
     // Force stdout to be line buffered
     setvbuf(stdout, stdoutBuffer, _IOLBF, sizeof(stdoutBuffer));
+
+    // We do this super early so that we can log from the rest of the init code
+    concurrency::hasBeenSetup = true;
+    consoleInit();
 
     if (portduino_config.force_simradio == true) {
         portduino_config.lora_module = use_simradio;
@@ -232,7 +246,9 @@ void portduinoSetup()
         std::cout << "Running in simulated mode." << std::endl;
         portduino_config.MaxNodes = 200; // Default to 200 nodes
         // Set the random seed equal to TCPPort to have a different seed per instance
-        randomSeed(TCPPort);
+        uint32_t seed = TCPPort;
+        HardwareRNG::seed(seed);
+        randomSeed(seed);
         return;
     }
 
@@ -276,6 +292,24 @@ void portduinoSetup()
                 }
                 std::cout << "autoconf: Found Pi HAT+ " << hat_vendor << " " << autoconf_product << " at /proc/device-tree/hat"
                           << std::endl;
+
+                // check for custom data fields
+                int i = 0;
+                while (access(("/proc/device-tree/hat/custom_" + std::to_string(i)).c_str(), R_OK) == 0) {
+                    std::ifstream customFieldFile(("/proc/device-tree/hat/custom_" + std::to_string(i)).c_str());
+                    if (customFieldFile.is_open()) {
+                        std::string customFieldName;
+                        std::string customFieldValue;
+                        getline(customFieldFile, customFieldName, ' ');
+                        getline(customFieldFile, customFieldValue, ' ');
+                        customFieldFile.close();
+
+                        printf("autoconf: Found hat+ custom field %s: %s\n", customFieldName.c_str(), customFieldValue.c_str());
+                        portduino_config.hat_plus_custom_fields[customFieldName] = customFieldValue;
+                    }
+
+                    i++;
+                }
 
                 // potential TODO: Validate that this is a real UUID
                 std::ifstream hatUUID("/proc/device-tree/hat/uuid");
@@ -460,10 +494,17 @@ void portduinoSetup()
             exit(EXIT_FAILURE);
         }
         char serial[9] = {0};
-        ch341Hal->getSerialString(serial, 8);
+        // Pass the full buffer size (9 = 8 chars + null) to getSerialString,
+        // not 8. The function treats `len` as buffer size and reserves one
+        // slot for the null terminator, so passing 8 produced a 7-char serial
+        // and broke the `strlen(serial) == 8` check below — masked on Linux
+        // by the BlueZ HCI MAC fallback in getMacAddr(), but on macOS (where
+        // the BlueZ path is __linux__-guarded) it left mac_address empty and
+        // meshtasticd refused to start.
+        ch341Hal->getSerialString(serial, sizeof(serial));
         std::cout << "CH341 Serial " << serial << std::endl;
         char product_string[96] = {0};
-        ch341Hal->getProductString(product_string, 95);
+        ch341Hal->getProductString(product_string, sizeof(product_string));
         std::cout << "CH341 Product " << product_string << std::endl;
         if (strlen(serial) == 8 && portduino_config.mac_address.length() < 12) {
             std::cout << "Deriving MAC address from Serial and Product String" << std::endl;
@@ -493,17 +534,24 @@ void portduinoSetup()
 #endif
     printf("MAC ADDRESS: %02X:%02X:%02X:%02X:%02X:%02X\n", dmac[0], dmac[1], dmac[2], dmac[3], dmac[4], dmac[5]);
     // Rather important to set this, if not running simulated.
-    randomSeed(time(NULL));
+    uint32_t seed = static_cast<uint32_t>(time(NULL));
+    HardwareRNG::seed(seed);
+    randomSeed(seed);
 
     std::string defaultGpioChipName = gpioChipName + std::to_string(portduino_config.lora_default_gpiochip);
+
+    std::set<int> used_pins;
+
     for (const auto *i : portduino_config.all_pins) {
-        if (i->enabled && i->pin > max_GPIO)
+        if (i->enabled && i->pin > max_GPIO) {
             max_GPIO = i->pin;
+        }
     }
 
     for (auto i : portduino_config.extra_pins) {
-        if (i.enabled && i.pin > max_GPIO)
+        if (i.enabled && i.pin > max_GPIO) {
             max_GPIO = i.pin;
+        }
     }
 
     gpioInit(max_GPIO + 1); // Done here so we can inform Portduino how many GPIOs we need.
@@ -517,12 +565,18 @@ void portduinoSetup()
             continue;
         }
         if (i->enabled) {
-            if (initGPIOPin(i->pin, gpioChipName + std::to_string(i->gpiochip), i->line) != ERRNO_OK) {
-                printf("Error setting pin number %d. It may not exist, or may already be in use.\n", i->line);
-                exit(EXIT_FAILURE);
+            if (used_pins.find(i->pin) != used_pins.end()) {
+                printf("Pin %d is in use for multiple purposes\n", i->pin);
+            } else {
+                if (initGPIOPin(i->pin, gpioChipName + std::to_string(i->gpiochip), i->line) != ERRNO_OK) {
+                    printf("Error setting pin number %d. It may not exist, or may already be in use.\n", i->line);
+                    exit(EXIT_FAILURE);
+                }
+                used_pins.insert(i->pin);
             }
         }
     }
+    printf("Initializing extra pins\n");
     for (auto i : portduino_config.extra_pins) {
         // In the case of a ch341 Lora device, we don't want to touch the system GPIO lines for Lora
         // Those GPIO are handled in our usermode driver instead.
@@ -530,10 +584,55 @@ void portduinoSetup()
             continue;
         }
         if (i.enabled) {
-            if (initGPIOPin(i.pin, gpioChipName + std::to_string(i.gpiochip), i.line) != ERRNO_OK) {
-                printf("Error setting pin number %d. It may not exist, or may already be in use.\n", i.line);
-                exit(EXIT_FAILURE);
+            if (used_pins.find(i.pin) != used_pins.end()) {
+                printf("Pin %d is in use for multiple purposes\n", i.pin);
+            } else {
+                if (initGPIOPin(i.pin, gpioChipName + std::to_string(i.gpiochip), i.line) != ERRNO_OK) {
+                    printf("Error setting pin number %d. It may not exist, or may already be in use.\n", i.line);
+                    exit(EXIT_FAILURE);
+                }
+                used_pins.insert(i.pin);
             }
+        }
+    }
+
+    // In one test, this dance seemed necessary to trigger the pin to detect properly.
+    if (portduino_config.lora_pa_detect_pin.enabled) {
+        pinMode(portduino_config.lora_pa_detect_pin.pin, INPUT_PULLDOWN);
+        sleep(1);
+        if (digitalRead(portduino_config.lora_pa_detect_pin.pin) == LOW) {
+            std::cout << "Pin " << portduino_config.lora_pa_detect_pin.pin << " PULLDOWN is LOW" << std::endl;
+        }
+        pinMode(portduino_config.lora_pa_detect_pin.pin, INPUT_PULLUP);
+        sleep(1);
+        if (digitalRead(portduino_config.lora_pa_detect_pin.pin) == HIGH) {
+            std::cout << "Pin " << portduino_config.lora_pa_detect_pin.pin << " PULLUP is HIGH, dropping PA curve" << std::endl;
+            portduino_config.num_pa_points = 1;
+            portduino_config.tx_gain_lora[0] = 0;
+        } else {
+            std::cout << "Pin " << portduino_config.lora_pa_detect_pin.pin << " PULLUP is LOW, using PA curve" << std::endl;
+        }
+
+        // disable bias once finished
+        pinMode(portduino_config.lora_pa_detect_pin.pin, INPUT);
+    } else if (portduino_config.hat_plus_custom_fields.find("io_slot1") != portduino_config.hat_plus_custom_fields.end()) {
+        printf("Hat+ io_slot1 is %s\n", portduino_config.hat_plus_custom_fields["io_slot1"].c_str());
+        if (portduino_config.hat_plus_custom_fields["io_slot1"] != "RAK13302") {
+            std::cout << "Hat+ io_slot1 is not RAK13302, skipping PA curve" << std::endl;
+            portduino_config.num_pa_points = 1;
+            portduino_config.tx_gain_lora[0] = 0;
+        }
+    }
+
+    for (auto i : portduino_config.extra_pins) {
+        // In the case of a ch341 Lora device, we don't want to touch the system GPIO lines for Lora
+        // Those GPIO are handled in our usermode driver instead.
+        if (i.config_section == "Lora" && portduino_config.lora_spi_dev == "ch341") {
+            continue;
+        }
+        if (i.enabled && i.default_high) {
+            pinMode(i.pin, OUTPUT);
+            digitalWrite(i.pin, HIGH);
         }
     }
 
@@ -555,7 +654,9 @@ void portduinoSetup()
         }
     } else if (portduino_config.JSONFilename != "") {
         try {
-            JSONFile.open(portduino_config.JSONFilename, std::ios::out | std::ios::app);
+            if (portduino_config.JSONFileRotate == 0) {
+                JSONFile.open(portduino_config.JSONFilename, std::ios::out | std::ios::app);
+            }
         } catch (std::ofstream::failure &e) {
             std::cout << "*** JSONFile Exception " << e.what() << std::endl;
             exit(EXIT_FAILURE);
@@ -568,7 +669,9 @@ void portduinoSetup()
     if (verboseEnabled && portduino_config.logoutputlevel != level_trace) {
         portduino_config.logoutputlevel = level_debug;
     }
-
+    if (portduino_config.lora_spi_dev != "") {
+        portduinoSetOptions({.realHardware = true});
+    }
     return;
 }
 
@@ -612,6 +715,7 @@ bool loadConfig(const char *configPath)
             }
             portduino_config.traceFilename = yamlConfig["Logging"]["TraceFile"].as<std::string>("");
             portduino_config.JSONFilename = yamlConfig["Logging"]["JSONFile"].as<std::string>("");
+            portduino_config.JSONFileRotate = yamlConfig["Logging"]["JSONFileRotate"].as<int>(0);
             portduino_config.JSONFilter = (_meshtastic_PortNum)yamlConfig["Logging"]["JSONFilter"].as<int>(0);
             if (yamlConfig["Logging"]["JSONFilter"].as<std::string>("") == "textmessage")
                 portduino_config.JSONFilter = meshtastic_PortNum_TEXT_MESSAGE_APP;
@@ -688,6 +792,17 @@ bool loadConfig(const char *configPath)
                     if (this_pin->config_section == "Lora") {
                         readGPIOFromYaml(yamlConfig["Lora"][this_pin->config_name], *this_pin);
                     }
+                }
+            }
+
+            if (yamlConfig["Lora"]["Enable_Pins"]) {
+                for (auto extra_pin : yamlConfig["Lora"]["Enable_Pins"]) {
+                    portduino_config.extra_pins.push_back(pinMapping());
+                    portduino_config.extra_pins.back().config_section = "Lora";
+                    portduino_config.extra_pins.back().config_name = "Enable_Pins";
+                    portduino_config.extra_pins.back().enabled = true;
+                    portduino_config.extra_pins.back().default_high = true;
+                    readGPIOFromYaml(extra_pin, portduino_config.extra_pins.back());
                 }
             }
 

@@ -6,6 +6,7 @@
 #include "NodeDB.h"
 #include "RTC.h"
 #include "Router.h"
+#include "TransmitHistory.h"
 #include "TypeConversions.h"
 #include "airtime.h"
 #include "configuration.h"
@@ -26,6 +27,15 @@ PositionModule::PositionModule()
     precision = 0;        // safe starting value
     isPromiscuous = true; // We always want to update our nodedb, even if we are sniffing on others
     nodeStatusObserver.observe(&nodeStatus->onNewStatus);
+
+    // Seed throttle timer from persisted transmit history so we don't re-broadcast immediately after reboot
+    if (transmitHistory) {
+        uint32_t restored = transmitHistory->getLastSentToMeshMillis(meshtastic_PortNum_POSITION_APP);
+        if (restored != 0) {
+            lastGpsSend = restored;
+            LOG_INFO("Position: restored lastGpsSend from transmit history");
+        }
+    }
 
     if (config.device.role != meshtastic_Config_DeviceConfig_Role_TRACKER &&
         config.device.role != meshtastic_Config_DeviceConfig_Role_TAK_TRACKER) {
@@ -438,6 +448,8 @@ int32_t PositionModule::runOnce()
             lastGpsLatitude = node->position.latitude_i;
             lastGpsLongitude = node->position.longitude_i;
 
+            if (transmitHistory)
+                transmitHistory->setLastSentToMesh(meshtastic_PortNum_POSITION_APP);
             sendOurPosition();
             if (config.device.role == meshtastic_Config_DeviceConfig_Role_LOST_AND_FOUND) {
                 sendLostAndFoundText();
@@ -455,7 +467,11 @@ int32_t PositionModule::runOnce()
             if (smartPosition.hasTraveledOverThreshold &&
                 Throttle::execute(
                     &lastGpsSend, minimumTimeThreshold, []() { positionModule->sendOurPosition(); },
-                    []() { LOG_DEBUG("Skip send smart broadcast due to time throttling"); })) {
+                    []() {
+#ifdef GPS_DEBUG
+                        LOG_DEBUG("Skip send smart broadcast due to time throttling");
+#endif
+                    })) {
 
                 LOG_DEBUG("Sent smart pos@%x:6 to mesh (distanceTraveled=%fm, minDistanceThreshold=%im, timeElapsed=%ims, "
                           "minTimeInterval=%ims)",
@@ -476,15 +492,24 @@ void PositionModule::sendLostAndFoundText()
 {
     meshtastic_MeshPacket *p = allocDataPacket();
     p->to = NODENUM_BROADCAST;
-    char *message = new char[60];
-    sprintf(message, "🚨I'm lost! Lat / Lon: %f, %f\a", (lastGpsLatitude * 1e-7), (lastGpsLongitude * 1e-7));
+    char message[128];
+    int written = snprintf(message, sizeof(message), "🚨I'm lost! Lat / Lon: %f, %f\a", (lastGpsLatitude * 1e-7),
+                           (lastGpsLongitude * 1e-7));
     p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
     p->want_ack = false;
-    p->decoded.payload.size = strlen(message);
-    memcpy(p->decoded.payload.bytes, message, p->decoded.payload.size);
+    if (written < 0) {
+        // snprintf encoding error — send an empty payload rather than uninitialized bytes.
+        p->decoded.payload.size = 0;
+    } else {
+        // Clamp to buffer capacity (snprintf returns "would-have-written" which can exceed the buffer).
+        const size_t msg_len = std::min(static_cast<size_t>(written), sizeof(message) - 1);
+        p->decoded.payload.size = msg_len;
+        if (msg_len > 0) {
+            memcpy(p->decoded.payload.bytes, message, msg_len);
+        }
+    }
 
     service->sendToMesh(p, RX_SRC_LOCAL, true);
-    delete[] message;
 }
 
 // Helper: return imprecise (truncated + centered) lat/lon as int32 using current precision
@@ -547,7 +572,11 @@ void PositionModule::handleNewPosition()
         if (smartPosition.hasTraveledOverThreshold &&
             Throttle::execute(
                 &lastGpsSend, minimumTimeThreshold, []() { positionModule->sendOurPosition(); },
-                []() { LOG_DEBUG("Skip send smart broadcast due to time throttling"); })) {
+                []() {
+#ifdef GPS_DEBUG
+                    LOG_DEBUG("Skip send smart broadcast due to time throttling");
+#endif
+                })) {
             LOG_DEBUG("Sent smart pos@%x:6 to mesh (distanceTraveled=%fm, minDistanceThreshold=%im, timeElapsed=%ims, "
                       "minTimeInterval=%ims)",
                       localPosition.timestamp, smartPosition.distanceTraveled, smartPosition.distanceThreshold, msSinceLastSend,

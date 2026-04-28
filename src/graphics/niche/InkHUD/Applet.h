@@ -3,7 +3,7 @@
 /*
 
     Base class for InkHUD applets
-    Must be overriden
+    Must be overridden
 
     An applet is one "program" which may show info on the display.
 
@@ -15,6 +15,7 @@
 
 #include <GFX.h> // GFXRoot drawing lib
 
+#include "mesh/MeshModule.h"
 #include "mesh/MeshTypes.h"
 
 #include "./AppletFont.h"
@@ -89,6 +90,9 @@ class Applet : public GFX
     virtual void onForeground() {}
     virtual void onBackground() {}
     virtual void onShutdown() {}
+
+    // Input Events
+
     virtual void onButtonShortPress() {}
     virtual void onButtonLongPress() {}
     virtual void onExitShort() {}
@@ -100,6 +104,27 @@ class Applet : public GFX
     virtual void onFreeText(char c) {}
     virtual void onFreeTextDone() {}
     virtual void onFreeTextCancel() {}
+    // Absolute display-space touch point, for touch-friendly UI interactions.
+    // Return true if consumed.
+    virtual bool onTouchPoint(uint16_t x, uint16_t y, bool longPress)
+    {
+        (void)x;
+        (void)y;
+        (void)longPress;
+        return false;
+    }
+    // List of inputs which can be subscribed to
+    enum InputMask {      // | No Joystick  |     With Joystick     |
+        BUTTON_SHORT = 1, // | Button Click | Joystick Center Click |
+        BUTTON_LONG = 2,  // | Button Hold  | Joystick Center Hold  |
+        EXIT_SHORT = 4,   // | no-op        | Back Button Click     |
+        EXIT_LONG = 8,    // | no-op        | Back Button Hold      |
+        NAV_UP = 16,      // | no-op        | Joystick Up           |
+        NAV_DOWN = 32,    // | no-op        | Joystick Down         |
+        NAV_LEFT = 64,    // | no-op        | Joystick Left         |
+        NAV_RIGHT = 128   // | no-op        | Joystick Right        |
+    };
+    bool isInputSubscribed(InputMask input); // Check if input should be handled by applet, this should not be overloaded.
 
     virtual bool approveNotification(Notification &n); // Allow an applet to veto a notification
 
@@ -120,6 +145,13 @@ class Applet : public GFX
     uint16_t Y(float f);                                                      // Map applet height, mapped from 0 to 1.0
     void setCrop(int16_t left, int16_t top, uint16_t width, uint16_t height); // Ignore pixels drawn outside a certain region
     void resetCrop();                                                         // Removes setCrop()
+
+    // User Input Handling
+
+    uint8_t subscribedInputs = 0b00000000; // Maybe uint16_t for futureproofing? other devices may need more inputs
+    void setInputsSubscribed(uint8_t input,
+                             bool captured); // Set if an input should be handled by applet or not, this should not be
+                                             // overloaded. Can take multiple inputs at once if you OR/`|` them together
 
     // Text
 
