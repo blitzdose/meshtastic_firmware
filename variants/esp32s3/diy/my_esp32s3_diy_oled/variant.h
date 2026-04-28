@@ -1,17 +1,34 @@
+#define STATION
+// #define MOBILE
+
+#ifdef STATION
 #define HAS_GPS 0
+#define HAS_SCREEN 0
+#define ADC_MULTIPLIER 2.14588
+#endif
+
+#ifdef MOBILE
+#define HAS_GPS 1
+#define HAS_SCREEN 1
+#define ADC_MULTIPLIER 1.61873
+#endif
+
+// #define HAS_GPS 1
 #define GPS_RX_PIN 44
 #define GPS_TX_PIN 43
 
-#define HAS_SCREEN 0
+
 // #define HAS_SDCARD
 // #define SDCARD_USE_SPI1
+
+// #define HAS_SCREEN 1
 
 #define USE_SSD1306
 
 #define I2C_SDA 2 // 1 // I2C pins for this board
 #define I2C_SCL 1 // 2
 
-// #define LED_POWER 38     // This is a RGB LED not a standard LED
+// #define LED_PIN 38     // This is a RGB LED not a standard LED
 #define HAS_NEOPIXEL                         // Enable the use of neopixels
 #define NEOPIXEL_COUNT 1                     // How many neopixels are connected
 #define NEOPIXEL_DATA 48                     // gpio pin used to send data to the neopixels
@@ -23,7 +40,7 @@
 #define BATTERY_PIN 3 // A battery voltage measurement pin, voltage divider connected here to measure battery voltage
 #define ADC_CHANNEL ADC1_GPIO3_CHANNEL
 #define BATTERY_SENSE_SAMPLES 30 // Set the number of samples, It has an effect of increasing sensitivity.
-#define ADC_MULTIPLIER 2.14588
+// #define ADC_MULTIPLIER 1.61873 // 2.14588 // 1.61873
 #define CELL_TYPE_LION // same curve for liion/lipo
 #define NUM_CELLS 1
 
