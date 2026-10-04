@@ -294,6 +294,10 @@ static int32_t reconnectWiFi()
                 WiFi.mode(WIFI_STA);
 #endif
                 WiFi.begin(wifiName, wifiPsw);
+#ifdef ARCH_ESP32
+                // ESP32 AUTH_EXPIRE bug fix
+                WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+#endif
             }
             isReconnecting = false;
             wifiReconnectPending = false;
